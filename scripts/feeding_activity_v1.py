@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("input", type=Path, help="Input video path.")
     parser.add_argument(
+        "--preset",
+        choices=("current", "previous", "motion_raw"),
+        default="current",
+        help="Method preset. Explicit method/weight flags override this preset.",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -115,9 +121,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--seg-method",
-        choices=("splash", "motion"),
-        default="splash",
-        help="Segmentation method. 'splash' uses fixed splash rules; 'motion' is the older motion mask.",
+        choices=("anomaly", "splash", "motion"),
+        default=None,
+        help="Segmentation method. 'anomaly' learns normal water/ripples; 'splash' uses fixed splash rules; 'motion' is the older motion mask.",
     )
     parser.add_argument(
         "--bright-value",
@@ -162,6 +168,36 @@ def parse_args() -> argparse.Namespace:
         help="Minimum Laplacian edge magnitude for splash/foam texture.",
     )
     parser.add_argument(
+        "--anomaly-learning-rate",
+        type=float,
+        default=0.03,
+        help="Learning rate for the adaptive normal-water anomaly model.",
+    )
+    parser.add_argument(
+        "--anomaly-color-z",
+        type=float,
+        default=2.4,
+        help="Positive z-score threshold for abnormal bright/white pixels.",
+    )
+    parser.add_argument(
+        "--anomaly-texture-z",
+        type=float,
+        default=2.0,
+        help="Positive z-score threshold for abnormal texture/edge pixels.",
+    )
+    parser.add_argument(
+        "--anomaly-flow-z",
+        type=float,
+        default=2.3,
+        help="Positive z-score threshold for abnormal optical-flow pixels.",
+    )
+    parser.add_argument(
+        "--anomaly-min-flow",
+        type=float,
+        default=1.0,
+        help="Minimum optical-flow magnitude for flow anomaly support.",
+    )
+    parser.add_argument(
         "--min-component-area",
         type=int,
         default=30,
@@ -174,9 +210,15 @@ def parse_args() -> argparse.Namespace:
         help="Percentile of optical-flow magnitude reported as flow activity.",
     )
     parser.add_argument(
+        "--flow-method",
+        choices=("auto", "dis", "farneback"),
+        default=None,
+        help="Optical-flow method. 'auto' uses DIS when available, otherwise Farneback.",
+    )
+    parser.add_argument(
         "--flow-mask",
         choices=("segmentation", "none"),
-        default="segmentation",
+        default=None,
         help="Use the segmentation mask to suppress ripple-only optical flow.",
     )
     parser.add_argument(
@@ -194,7 +236,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--flow-weight",
         type=float,
-        default=0.1,
+        default=None,
         help="Weight for splash-flow energy in the total activity score.",
     )
     parser.add_argument(
@@ -202,7 +244,34 @@ def parse_args() -> argparse.Namespace:
         default="mp4v",
         help="FourCC codec for the output video.",
     )
-    return parser.parse_args()
+    return apply_preset(parser.parse_args())
+
+
+def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
+    presets = {
+        "current": {
+            "seg_method": "anomaly",
+            "flow_method": "auto",
+            "flow_mask": "segmentation",
+            "flow_weight": 0.03,
+        },
+        "previous": {
+            "seg_method": "splash",
+            "flow_method": "farneback",
+            "flow_mask": "segmentation",
+            "flow_weight": 0.1,
+        },
+        "motion_raw": {
+            "seg_method": "motion",
+            "flow_method": "farneback",
+            "flow_mask": "none",
+            "flow_weight": 0.1,
+        },
+    }
+    for name, value in presets[args.preset].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    return args
 
 
 def resize_frame(frame: np.ndarray, target_width: int) -> np.ndarray:
@@ -243,11 +312,165 @@ def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     return clean
 
 
+def create_flow_estimator(method: str) -> tuple[object | None, str]:
+    if method in {"auto", "dis"} and hasattr(cv2, "DISOpticalFlow_create"):
+        preset = getattr(
+            cv2,
+            "DISOPTICAL_FLOW_PRESET_FINE",
+            getattr(cv2, "DISOPTICAL_FLOW_PRESET_MEDIUM", 1),
+        )
+        return cv2.DISOpticalFlow_create(preset), "dis"
+    if method == "dis":
+        raise RuntimeError("DIS optical flow is not available in this OpenCV build.")
+    return None, "farneback"
+
+
+class AdaptiveSplashSegmenter:
+    """Unsupervised water-splash segmenter with an adaptive normal-water model."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.means: dict[str, np.ndarray] | None = None
+        self.vars: dict[str, np.ndarray] | None = None
+
+    def _feature_maps(
+        self,
+        roi_bgr: np.ndarray,
+        roi_gray_blur: np.ndarray,
+        flow_mag: np.ndarray,
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+        hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+        _hue, saturation_u8, value_u8 = cv2.split(hsv)
+        saturation = saturation_u8.astype(np.float32)
+        value = value_u8.astype(np.float32)
+        white_score = value - 0.55 * saturation
+
+        gray_f = roi_gray_blur.astype(np.float32)
+        local_mean = cv2.blur(gray_f, (7, 7))
+        local_sq_mean = cv2.blur(gray_f * gray_f, (7, 7))
+        texture = np.sqrt(np.maximum(local_sq_mean - local_mean * local_mean, 0.0))
+        edge = np.abs(cv2.Laplacian(roi_gray_blur, cv2.CV_32F, ksize=3))
+
+        features = {
+            "value": value,
+            "white": white_score,
+            "texture": texture,
+            "edge": edge,
+            "flow": flow_mag.astype(np.float32),
+        }
+        return features, saturation_u8, value_u8, white_score
+
+    def _init_stats(self, features: dict[str, np.ndarray]) -> None:
+        self.means = {name: feature.copy() for name, feature in features.items()}
+        self.vars = {
+            name: np.full_like(feature, 25.0, dtype=np.float32)
+            for name, feature in features.items()
+        }
+
+    def _update_stats(
+        self,
+        features: dict[str, np.ndarray],
+        update_mask: np.ndarray,
+    ) -> None:
+        if self.means is None or self.vars is None:
+            self._init_stats(features)
+            return
+
+        alpha = float(np.clip(self.args.anomaly_learning_rate, 0.001, 1.0))
+        idx = update_mask.astype(bool)
+        if not np.any(idx):
+            return
+
+        for name, feature in features.items():
+            mean = self.means[name]
+            var = self.vars[name]
+            delta = feature - mean
+            mean[idx] += alpha * delta[idx]
+            var[idx] = (1.0 - alpha) * (var[idx] + alpha * delta[idx] * delta[idx])
+            np.maximum(var, 1.0, out=var)
+
+    def _positive_z(self, name: str, feature: np.ndarray) -> np.ndarray:
+        assert self.means is not None and self.vars is not None
+        z = (feature - self.means[name]) / np.sqrt(self.vars[name] + 1e-6)
+        return np.maximum(z, 0.0)
+
+    def compute(
+        self,
+        roi_bgr: np.ndarray,
+        roi_gray_blur: np.ndarray,
+        flow_mag: np.ndarray,
+        fg_mask: np.ndarray,
+        diff_mask: np.ndarray,
+        processed_index: int,
+    ) -> tuple[np.ndarray, float]:
+        features, saturation, value, white_score = self._feature_maps(
+            roi_bgr,
+            roi_gray_blur,
+            flow_mag,
+        )
+
+        if self.means is None or self.vars is None:
+            self._init_stats(features)
+
+        if processed_index < self.args.warmup_frames:
+            self._update_stats(features, np.ones_like(value, dtype=bool))
+            mask = np.zeros_like(value, dtype=np.uint8)
+            return mask, 0.0
+
+        z_value = self._positive_z("value", features["value"])
+        z_white = self._positive_z("white", features["white"])
+        z_texture = self._positive_z("texture", features["texture"])
+        z_edge = self._positive_z("edge", features["edge"])
+        z_flow = self._positive_z("flow", features["flow"])
+
+        absolute_foam = (
+            (value >= self.args.splash_min_value)
+            & (saturation <= self.args.splash_max_saturation)
+            & (white_score >= self.args.splash_white_score)
+        )
+        absolute_texture = (
+            (features["texture"] >= self.args.splash_texture_threshold)
+            | (features["edge"] >= self.args.splash_edge_threshold)
+        )
+        color_anomaly = (
+            (z_white >= self.args.anomaly_color_z)
+            | (z_value >= self.args.anomaly_color_z)
+        )
+        texture_anomaly = (
+            (z_texture >= self.args.anomaly_texture_z)
+            | (z_edge >= self.args.anomaly_texture_z)
+        )
+        flow_anomaly = (
+            (z_flow >= self.args.anomaly_flow_z)
+            & (features["flow"] >= self.args.anomaly_min_flow)
+        )
+        motion_support = fg_mask | diff_mask | flow_anomaly
+
+        mask_bool = (
+            (absolute_foam & absolute_texture & motion_support)
+            | (color_anomaly & texture_anomaly & motion_support)
+            | (absolute_foam & flow_anomaly)
+        )
+
+        mask = (mask_bool.astype(np.uint8)) * 255
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        mask = remove_small_components(mask, self.args.min_component_area)
+
+        self._update_stats(features, mask == 0)
+        activity_pct = 100.0 * float(cv2.countNonZero(mask)) / float(mask.size)
+        return mask, activity_pct
+
+
 def compute_segmentation_mask(
     roi_bgr: np.ndarray,
     roi_gray_blur: np.ndarray,
     prev_gray_blur: np.ndarray | None,
+    flow_mag: np.ndarray,
     subtractor: cv2.BackgroundSubtractor,
+    anomaly_segmenter: AdaptiveSplashSegmenter,
     args: argparse.Namespace,
     processed_index: int,
 ) -> tuple[np.ndarray, float]:
@@ -261,6 +484,16 @@ def compute_segmentation_mask(
         adaptive_threshold = float(np.percentile(diff, args.diff_percentile))
         threshold = max(args.diff_min_threshold, adaptive_threshold)
         diff_mask = diff > threshold
+
+    if args.seg_method == "anomaly":
+        return anomaly_segmenter.compute(
+            roi_bgr,
+            roi_gray_blur,
+            flow_mag,
+            fg_mask,
+            diff_mask,
+            processed_index,
+        )
 
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     _hue, saturation, value = cv2.split(hsv)
@@ -308,22 +541,26 @@ def compute_segmentation_mask(
 def compute_flow_magnitude(
     roi_gray_blur: np.ndarray,
     prev_gray_blur: np.ndarray | None,
+    flow_estimator: object | None,
 ) -> np.ndarray:
     if prev_gray_blur is None:
         return np.zeros_like(roi_gray_blur, dtype=np.float32)
 
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_gray_blur,
-        roi_gray_blur,
-        None,
-        pyr_scale=0.5,
-        levels=3,
-        winsize=21,
-        iterations=3,
-        poly_n=5,
-        poly_sigma=1.2,
-        flags=0,
-    )
+    if flow_estimator is not None:
+        flow = flow_estimator.calc(prev_gray_blur, roi_gray_blur, None)
+    else:
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray_blur,
+            roi_gray_blur,
+            None,
+            pyr_scale=0.5,
+            levels=3,
+            winsize=21,
+            iterations=3,
+            poly_n=5,
+            poly_sigma=1.2,
+            flags=0,
+        )
     mag, _ = cv2.cartToPolar(flow[:, :, 0], flow[:, :, 1])
     return mag
 
@@ -551,6 +788,8 @@ def main() -> int:
         varThreshold=args.bg_var_threshold,
         detectShadows=False,
     )
+    anomaly_segmenter = AdaptiveSplashSegmenter(args)
+    flow_estimator, flow_method = create_flow_estimator(args.flow_method)
     csv_output.parent.mkdir(parents=True, exist_ok=True)
     csv_file = csv_output.open("w", newline="")
     csv_writer = csv.DictWriter(
@@ -561,7 +800,9 @@ def main() -> int:
             "time_s",
             "roi_x0",
             "roi_x1",
+            "preset",
             "seg_method",
+            "flow_method",
             "flow_mask",
             "seg_weight",
             "flow_weight",
@@ -586,13 +827,19 @@ def main() -> int:
                 roi = frame[:, x0:x1]
                 gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                 gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
-                raw_flow_mag = compute_flow_magnitude(gray_blur, prev_gray_blur)
+                raw_flow_mag = compute_flow_magnitude(
+                    gray_blur,
+                    prev_gray_blur,
+                    flow_estimator,
+                )
 
                 mask, seg_activity_pct = compute_segmentation_mask(
                     roi,
                     gray_blur,
                     prev_gray_blur,
+                    raw_flow_mag,
                     subtractor,
+                    anomaly_segmenter,
                     args,
                     processed_index,
                 )
@@ -636,7 +883,9 @@ def main() -> int:
                         "time_s": f"{time_s:.6f}",
                         "roi_x0": x0,
                         "roi_x1": x1,
+                        "preset": args.preset,
                         "seg_method": args.seg_method,
+                        "flow_method": flow_method,
                         "flow_mask": args.flow_mask,
                         "seg_weight": f"{args.seg_weight:.6f}",
                         "flow_weight": f"{args.flow_weight:.6f}",
