@@ -198,6 +198,54 @@ def parse_args() -> argparse.Namespace:
         help="Minimum optical-flow magnitude for flow anomaly support.",
     )
     parser.add_argument(
+        "--artifact-filter",
+        choices=("on", "off"),
+        default=None,
+        help="Reject persistent/smooth ripple, reflection, and bubble-like components.",
+    )
+    parser.add_argument(
+        "--artifact-min-texture-mean",
+        type=float,
+        default=12.0,
+        help="Components below this mean texture can be treated as smooth artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-min-edge-density",
+        type=float,
+        default=0.04,
+        help="Components below this edge-density can be treated as smooth artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-min-flow-chaos",
+        type=float,
+        default=0.45,
+        help="Minimum flow coefficient of variation expected from chaotic splash motion.",
+    )
+    parser.add_argument(
+        "--artifact-persistence-frames",
+        type=float,
+        default=8.0,
+        help="Mean per-pixel age after which static components are treated as artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-static-new-ratio",
+        type=float,
+        default=0.35,
+        help="Maximum new-pixel ratio for persistent/static reflection or bubble artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-max-bubble-area-pct",
+        type=float,
+        default=0.25,
+        help="Small persistent components under this ROI area percent can be treated as bubbles.",
+    )
+    parser.add_argument(
+        "--artifact-min-reflection-area-pct",
+        type=float,
+        default=1.0,
+        help="Large smooth components over this ROI area percent can be treated as reflections.",
+    )
+    parser.add_argument(
         "--min-component-area",
         type=int,
         default=30,
@@ -254,18 +302,21 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "flow_method": "auto",
             "flow_mask": "segmentation",
             "flow_weight": 0.03,
+            "artifact_filter": "on",
         },
         "previous": {
             "seg_method": "splash",
             "flow_method": "farneback",
             "flow_mask": "segmentation",
             "flow_weight": 0.1,
+            "artifact_filter": "off",
         },
         "motion_raw": {
             "seg_method": "motion",
             "flow_method": "farneback",
             "flow_mask": "none",
             "flow_weight": 0.1,
+            "artifact_filter": "off",
         },
     }
     for name, value in presets[args.preset].items():
@@ -332,6 +383,8 @@ class AdaptiveSplashSegmenter:
         self.args = args
         self.means: dict[str, np.ndarray] | None = None
         self.vars: dict[str, np.ndarray] | None = None
+        self.prev_filtered_mask: np.ndarray | None = None
+        self.persistence: np.ndarray | None = None
 
     def _feature_maps(
         self,
@@ -393,6 +446,91 @@ class AdaptiveSplashSegmenter:
         assert self.means is not None and self.vars is not None
         z = (feature - self.means[name]) / np.sqrt(self.vars[name] + 1e-6)
         return np.maximum(z, 0.0)
+
+    def _update_artifact_state(self, mask: np.ndarray) -> None:
+        mask_bool = mask > 0
+        if self.persistence is None or self.persistence.shape != mask.shape:
+            self.persistence = np.zeros(mask.shape, dtype=np.float32)
+        self.persistence[mask_bool] = np.minimum(self.persistence[mask_bool] + 1.0, 255.0)
+        self.persistence[~mask_bool] *= 0.70
+        self.prev_filtered_mask = mask_bool.copy()
+
+    def _filter_artifacts(
+        self,
+        mask: np.ndarray,
+        features: dict[str, np.ndarray],
+    ) -> np.ndarray:
+        if self.args.artifact_filter != "on":
+            self._update_artifact_state(mask)
+            return mask
+
+        if cv2.countNonZero(mask) == 0:
+            self._update_artifact_state(mask)
+            return mask
+
+        if self.persistence is None or self.persistence.shape != mask.shape:
+            self.persistence = np.zeros(mask.shape, dtype=np.float32)
+        if self.prev_filtered_mask is None or self.prev_filtered_mask.shape != mask.shape:
+            prev_mask = np.zeros(mask.shape, dtype=bool)
+        else:
+            prev_mask = self.prev_filtered_mask
+
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        filtered = np.zeros_like(mask)
+        roi_area = float(mask.size)
+
+        for component_id in range(1, component_count):
+            area = int(stats[component_id, cv2.CC_STAT_AREA])
+            if area <= 0:
+                continue
+
+            component = labels == component_id
+            area_pct = 100.0 * area / roi_area
+            texture_values = features["texture"][component]
+            edge_values = features["edge"][component]
+            flow_values = features["flow"][component]
+
+            texture_mean = float(np.mean(texture_values)) if texture_values.size else 0.0
+            edge_density = float(np.mean(edge_values >= self.args.splash_edge_threshold))
+            flow_mean = float(np.mean(flow_values)) if flow_values.size else 0.0
+            flow_std = float(np.std(flow_values)) if flow_values.size else 0.0
+            flow_chaos = flow_std / (flow_mean + 1e-6)
+            prev_overlap = float(np.mean(prev_mask[component]))
+            new_ratio = 1.0 - prev_overlap
+            mean_age = float(np.mean(self.persistence[component]))
+
+            smooth_texture = (
+                texture_mean < self.args.artifact_min_texture_mean
+                or edge_density < self.args.artifact_min_edge_density
+            )
+            coherent_flow = (
+                flow_mean >= self.args.anomaly_min_flow
+                and flow_chaos < self.args.artifact_min_flow_chaos
+            )
+            persistent_static = (
+                mean_age >= self.args.artifact_persistence_frames
+                and new_ratio <= self.args.artifact_static_new_ratio
+            )
+
+            reject_ripple_like = smooth_texture and coherent_flow and new_ratio < 0.65
+            reject_persistent_bubble = (
+                persistent_static
+                and area_pct <= self.args.artifact_max_bubble_area_pct
+                and (coherent_flow or smooth_texture)
+            )
+            reject_smooth_reflection = (
+                persistent_static
+                and area_pct >= self.args.artifact_min_reflection_area_pct
+                and smooth_texture
+            )
+
+            if reject_ripple_like or reject_persistent_bubble or reject_smooth_reflection:
+                continue
+
+            filtered[component] = 255
+
+        self._update_artifact_state(filtered)
+        return filtered
 
     def compute(
         self,
@@ -458,6 +596,7 @@ class AdaptiveSplashSegmenter:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
         mask = cv2.dilate(mask, kernel, iterations=1)
         mask = remove_small_components(mask, self.args.min_component_area)
+        mask = self._filter_artifacts(mask, features)
 
         self._update_stats(features, mask == 0)
         activity_pct = 100.0 * float(cv2.countNonZero(mask)) / float(mask.size)
@@ -804,6 +943,7 @@ def main() -> int:
             "seg_method",
             "flow_method",
             "flow_mask",
+            "artifact_filter",
             "seg_weight",
             "flow_weight",
             "segmentation_activity_pct",
@@ -887,6 +1027,7 @@ def main() -> int:
                         "seg_method": args.seg_method,
                         "flow_method": flow_method,
                         "flow_mask": args.flow_mask,
+                        "artifact_filter": args.artifact_filter,
                         "seg_weight": f"{args.seg_weight:.6f}",
                         "flow_weight": f"{args.flow_weight:.6f}",
                         "segmentation_activity_pct": f"{seg_activity_pct:.6f}",

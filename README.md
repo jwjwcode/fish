@@ -22,6 +22,11 @@ anomaly model. It learns normal water/ripple appearance and detects abnormal
 bright/white, textured, edged, and motion-supported splash pixels. This is
 intended to suppress smooth wind ripples.
 
+The current preset also applies component-level artifact filtering after
+segmentation. It removes components that look like smooth/coherent ripple,
+persistent sunlight reflection, or small persistent white bubbles using
+component texture, edge density, flow chaos, and temporal persistence.
+
 By default, `optical_flow_activity` is a splash-flow energy score: optical flow
 inside the segmentation mask, weighted by mask area. This suppresses ripple-only
 optical flow or tiny false masks. The CSV also includes
@@ -92,7 +97,7 @@ Older motion-mask + raw-flow comparison:
 Useful tuning flags:
 
 ```bash
---preset current         # adaptive anomaly seg + DIS/auto flow + masked flow
+--preset current         # adaptive anomaly seg + artifact filter + DIS/auto flow
 --preset previous        # fixed splash seg + Farneback + masked flow
 --preset motion_raw      # older motion seg + Farneback + raw flow
 --warmup-frames 0        # show segmentation immediately
@@ -104,6 +109,7 @@ Useful tuning flags:
 --seg-method motion      # use the older motion-based segmentation
 --flow-method farneback  # compare against the fallback optical-flow method
 --flow-mask none         # use raw optical flow instead of segmentation-masked flow
+--artifact-filter off    # disable ripple/reflection/bubble component filtering
 --seg-weight 1           # segmentation contribution to total_activity
 --flow-weight 0.03       # optical-flow contribution to total_activity
 ```
