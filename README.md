@@ -73,6 +73,17 @@ For a quick short test:
   --frame-step 2
 ```
 
+To run from a repeatable config:
+
+```bash
+.venv/bin/python scripts/feeding_activity_v1.py \
+  A6_20260506T161254_abw722_biomass14944_feed12_feedcap12_feedremaining-0_score5.mkv \
+  --config configs/unsup_no_flow.json
+```
+
+Config keys use the same names as CLI options, without the leading `--`. Nested
+sections are allowed; command-line flags override matching config values.
+
 ## Presets
 
 Current optimized V1:

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+import sys
 from pathlib import Path
 
 try:
@@ -29,11 +31,88 @@ except ModuleNotFoundError as exc:  # pragma: no cover - user-facing startup gua
     ) from exc
 
 
-def parse_args() -> argparse.Namespace:
+def _provided_cli_dests(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    option_to_dest = {
+        option: action.dest
+        for action in parser._actions
+        for option in action.option_strings
+    }
+    provided: set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        option = token.split("=", 1)[0]
+        if option in option_to_dest:
+            provided.add(option_to_dest[option])
+    return provided
+
+
+def _flatten_config(config: object) -> dict[str, object]:
+    if not isinstance(config, dict):
+        raise SystemExit("Config file must contain a JSON object.")
+
+    flat: dict[str, object] = {}
+    for key, value in config.items():
+        if isinstance(value, dict):
+            nested = _flatten_config(value)
+            for nested_key, nested_value in nested.items():
+                if nested_key in flat:
+                    raise SystemExit(f"Duplicate config key: {nested_key}")
+                flat[nested_key] = nested_value
+        else:
+            if key in flat:
+                raise SystemExit(f"Duplicate config key: {key}")
+            flat[key] = value
+    return flat
+
+
+def _load_config_values(
+    parser: argparse.ArgumentParser,
+    config_path: Path | None,
+) -> dict[str, object]:
+    if config_path is None:
+        return {}
+    try:
+        with config_path.open() as config_file:
+            config = json.load(config_file)
+    except OSError as exc:
+        raise SystemExit(f"Could not read config file: {config_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON config file: {config_path}: {exc}") from exc
+
+    action_by_dest = {action.dest: action for action in parser._actions}
+    values: dict[str, object] = {}
+    for dest, value in _flatten_config(config).items():
+        action = action_by_dest.get(dest)
+        if action is None:
+            continue
+        if action.type is not None and value is not None:
+            try:
+                value = action.type(value)
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(f"Invalid config value for {dest}: {value}") from exc
+        if action.choices is not None and value not in action.choices:
+            choices = ", ".join(str(choice) for choice in action.choices)
+            raise SystemExit(
+                f"Invalid config value for {dest}: {value}. Choose one of: {choices}"
+            )
+        values[dest] = value
+    return values
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    if argv is None:
+        argv = sys.argv[1:]
     parser = argparse.ArgumentParser(
         description="Create annotated fish-feeding activity video from one input video."
     )
     parser.add_argument("input", type=Path, help="Input video path.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="JSON config file. Command-line flags override matching config keys.",
+    )
     parser.add_argument(
         "--preset",
         choices=("current", "previous", "motion_raw"),
@@ -292,7 +371,13 @@ def parse_args() -> argparse.Namespace:
         default="mp4v",
         help="FourCC codec for the output video.",
     )
-    return apply_preset(parser.parse_args())
+    args = parser.parse_args(argv)
+    provided_dests = _provided_cli_dests(parser, argv)
+    config_values = _load_config_values(parser, args.config)
+    for dest, value in config_values.items():
+        if dest not in provided_dests:
+            setattr(args, dest, value)
+    return apply_preset(args)
 
 
 def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
