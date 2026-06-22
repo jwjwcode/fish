@@ -34,6 +34,8 @@ optical flow or tiny false masks. The CSV also includes
 
 The default optical-flow method is `auto`, which uses DIS optical flow when this
 OpenCV build provides it and falls back to Farneback otherwise.
+Use `--flow-method none` to skip optical-flow calculation entirely. This makes
+the output a segmentation-only activity score and sets the flow columns to zero.
 
 ## Setup
 
@@ -107,6 +109,7 @@ Useful tuning flags:
 --seg-method anomaly     # adaptive water/ripple anomaly segmentation, default
 --seg-method splash      # fixed splash/foam heuristic
 --seg-method motion      # use the older motion-based segmentation
+--flow-method none       # skip optical flow for faster segmentation-only scoring
 --flow-method farneback  # compare against the fallback optical-flow method
 --flow-mask none         # use raw optical flow instead of segmentation-masked flow
 --artifact-filter off    # disable ripple/reflection/bubble component filtering

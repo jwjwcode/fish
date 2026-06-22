@@ -259,9 +259,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--flow-method",
-        choices=("auto", "dis", "farneback"),
+        choices=("auto", "dis", "farneback", "none"),
         default=None,
-        help="Optical-flow method. 'auto' uses DIS when available, otherwise Farneback.",
+        help="Optical-flow method. 'none' skips flow calculation.",
     )
     parser.add_argument(
         "--flow-mask",
@@ -322,6 +322,9 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     for name, value in presets[args.preset].items():
         if getattr(args, name) is None:
             setattr(args, name, value)
+    if args.flow_method == "none":
+        args.flow_mask = "none"
+        args.flow_weight = 0.0
     return args
 
 
@@ -364,6 +367,8 @@ def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
 
 
 def create_flow_estimator(method: str) -> tuple[object | None, str]:
+    if method == "none":
+        return None, "none"
     if method in {"auto", "dis"} and hasattr(cv2, "DISOpticalFlow_create"):
         preset = getattr(
             cv2,
@@ -967,11 +972,14 @@ def main() -> int:
                 roi = frame[:, x0:x1]
                 gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                 gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
-                raw_flow_mag = compute_flow_magnitude(
-                    gray_blur,
-                    prev_gray_blur,
-                    flow_estimator,
-                )
+                if flow_method == "none":
+                    raw_flow_mag = np.zeros_like(gray_blur, dtype=np.float32)
+                else:
+                    raw_flow_mag = compute_flow_magnitude(
+                        gray_blur,
+                        prev_gray_blur,
+                        flow_estimator,
+                    )
 
                 mask, seg_activity_pct = compute_segmentation_mask(
                     roi,
@@ -983,13 +991,18 @@ def main() -> int:
                     args,
                     processed_index,
                 )
-                flow_mask = mask if args.flow_mask == "segmentation" else None
-                flow_mag, flow_activity, raw_flow_activity = score_flow(
-                    raw_flow_mag,
-                    args.flow_percentile,
-                    flow_mask,
-                    args.flow_min_mask_pixels,
-                )
+                if flow_method == "none":
+                    flow_mag = raw_flow_mag
+                    flow_activity = 0.0
+                    raw_flow_activity = 0.0
+                else:
+                    flow_mask = mask if args.flow_mask == "segmentation" else None
+                    flow_mag, flow_activity, raw_flow_activity = score_flow(
+                        raw_flow_mag,
+                        args.flow_percentile,
+                        flow_mask,
+                        args.flow_min_mask_pixels,
+                    )
 
                 seg_score = args.seg_weight * seg_activity_pct
                 flow_score = args.flow_weight * flow_activity
