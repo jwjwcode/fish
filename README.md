@@ -43,6 +43,15 @@ the output a segmentation-only activity score and sets the flow columns to zero.
 python3 -m pip install -r requirements.txt
 ```
 
+## Project layout
+
+```text
+scripts/feeding_activity_v1.py  # compatibility CLI wrapper
+fish_activity/pipeline_v1.py    # current V1 implementation
+configs/                        # reproducible tuning/deployment settings
+docs/development_plan.md        # branch/refactor roadmap
+```
+
 ## Run
 
 ```bash
@@ -116,3 +125,6 @@ Useful tuning flags:
 --seg-weight 1           # segmentation contribution to total_activity
 --flow-weight 0.03       # optical-flow contribution to total_activity
 ```
+
+For repeatable experiments, prefer saving settings in `configs/` and writing
+outputs to a named `results/` folder instead of relying on one-off shell history.

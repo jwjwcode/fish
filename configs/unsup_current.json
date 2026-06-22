@@ -1,0 +1,15 @@
+{
+  "resize_width": 2560,
+  "detector": {
+    "type": "unsupervised",
+    "preset": "current",
+    "seg_method": "anomaly",
+    "flow_method": "auto",
+    "flow_mask": "segmentation",
+    "artifact_filter": "on"
+  },
+  "scoring": {
+    "seg_weight": 1.0,
+    "flow_weight": 0.03
+  }
+}
