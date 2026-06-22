@@ -17,6 +17,10 @@ optical_flow_score = flow_weight * optical_flow_activity
 total_activity = segmentation_score + optical_flow_score
 ```
 
+The annotated video also shows `Prev10 avg`, the average total score from the
+previous processed frames, up to 10 frames. The CSV includes matching previous
+10-frame averages for segmentation, optical-flow, and total scores.
+
 By default, `segmentation_activity_pct` uses an adaptive unsupervised splash
 anomaly model. It learns normal water/ripple appearance and detects abnormal
 bright/white, textured, edged, and motion-supported splash pixels. This is

@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import sys
+from collections import deque
 from pathlib import Path
 
 try:
@@ -436,8 +437,35 @@ def bottom_panel_layout(
     available_for_maps = max(240, frame_width - text_area_width - 72)
     preview_width = min(requested_preview_width, max(120, available_for_maps // 2))
     preview_height = max(1, int(round(frame_height * (preview_width / frame_width))))
-    panel_height = max(160, preview_height + 56)
+    panel_height = max(190, preview_height + 56)
     return panel_height, preview_width, text_area_width
+
+
+def average_score_history(score_history: deque[dict[str, float]]) -> dict[str, float]:
+    if not score_history:
+        return {
+            "previous_10_frame_count": 0.0,
+            "segmentation_score_prev10_avg": 0.0,
+            "optical_flow_score_prev10_avg": 0.0,
+            "total_activity_prev10_avg": 0.0,
+        }
+
+    count = float(len(score_history))
+    return {
+        "previous_10_frame_count": count,
+        "segmentation_score_prev10_avg": sum(
+            score["segmentation_score"] for score in score_history
+        )
+        / count,
+        "optical_flow_score_prev10_avg": sum(
+            score["optical_flow_score"] for score in score_history
+        )
+        / count,
+        "total_activity_prev10_avg": sum(
+            score["total_activity"] for score in score_history
+        )
+        / count,
+    }
 
 
 def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
@@ -950,6 +978,7 @@ def overlay_visuals(
         f"Seg score:    {values['seg_score']:7.3f}",
         f"Flow score:   {values['flow_score']:7.3f}",
         f"Total score:  {values['total_activity']:7.3f}",
+        f"Prev10 avg:   {values['total_activity_prev10_avg']:7.3f}",
     ]
     panel_y = height
     put_text_panel(canvas, lines, (18, panel_y + 16))
@@ -1042,11 +1071,16 @@ def main() -> int:
             "optical_flow_score",
             "optical_flow_raw_activity",
             "total_activity",
+            "previous_10_frame_count",
+            "segmentation_score_prev10_avg",
+            "optical_flow_score_prev10_avg",
+            "total_activity_prev10_avg",
         ],
     )
     csv_writer.writeheader()
 
     prev_gray_blur: np.ndarray | None = None
+    score_history: deque[dict[str, float]] = deque(maxlen=10)
     processed_index = 0
     source_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
     max_end_time = args.start_second + args.duration if args.duration > 0 else None
@@ -1092,6 +1126,7 @@ def main() -> int:
                 seg_score = args.seg_weight * seg_activity_pct
                 flow_score = args.flow_weight * flow_activity
                 total_activity = seg_score + flow_score
+                score_averages = average_score_history(score_history)
                 time_s = args.start_second + (processed_index * args.frame_step / fps)
 
                 annotated = overlay_visuals(
@@ -1107,6 +1142,9 @@ def main() -> int:
                         "flow_score": flow_score,
                         "raw_flow_activity": raw_flow_activity,
                         "total_activity": total_activity,
+                        "total_activity_prev10_avg": score_averages[
+                            "total_activity_prev10_avg"
+                        ],
                     },
                     time_s,
                     preview_width,
@@ -1134,6 +1172,25 @@ def main() -> int:
                         "optical_flow_score": f"{flow_score:.6f}",
                         "optical_flow_raw_activity": f"{raw_flow_activity:.6f}",
                         "total_activity": f"{total_activity:.6f}",
+                        "previous_10_frame_count": (
+                            f"{int(score_averages['previous_10_frame_count'])}"
+                        ),
+                        "segmentation_score_prev10_avg": (
+                            f"{score_averages['segmentation_score_prev10_avg']:.6f}"
+                        ),
+                        "optical_flow_score_prev10_avg": (
+                            f"{score_averages['optical_flow_score_prev10_avg']:.6f}"
+                        ),
+                        "total_activity_prev10_avg": (
+                            f"{score_averages['total_activity_prev10_avg']:.6f}"
+                        ),
+                    }
+                )
+                score_history.append(
+                    {
+                        "segmentation_score": seg_score,
+                        "optical_flow_score": flow_score,
+                        "total_activity": total_activity,
                     }
                 )
                 prev_gray_blur = gray_blur
