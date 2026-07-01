@@ -50,10 +50,17 @@ python3 -m pip install -r requirements.txt
 ## Project layout
 
 ```text
-scripts/feeding_activity_v1.py  # compatibility CLI wrapper
-fish_activity/pipeline_v1.py    # current V1 implementation
-configs/                        # reproducible tuning/deployment settings
-docs/development_plan.md        # branch/refactor roadmap
+scripts/feeding_activity_v1.py       # compatibility CLI wrapper
+fish_activity/pipeline_v1.py         # V1 CLI orchestration
+fish_activity/config.py              # config loading and presets
+fish_activity/detectors/base.py      # common detector result contract
+fish_activity/detectors/unsupervised.py
+fish_activity/scoring.py             # activity score calculations
+fish_activity/render.py              # debug video overlays
+fish_activity/video_io.py            # video writer helpers
+fish_activity/decision.py            # local feeding start/pause/finish logic
+configs/                             # reproducible tuning/deployment settings
+docs/development_plan.md             # branch/refactor roadmap
 ```
 
 ## Run
@@ -139,6 +146,46 @@ Useful tuning flags:
 --artifact-filter off    # disable ripple/reflection/bubble component filtering
 --seg-weight 1           # segmentation contribution to total_activity
 --flow-weight 0.03       # optical-flow contribution to total_activity
+```
+
+## Feeding decision logic
+
+The V1 pipeline now includes local command logic for control experiments. It
+does not publish MQTT yet; it writes command/state fields to the CSV and debug
+video. The annotated video shows the current command, the last command with its
+timestamp, and a highlighted bottom-strip banner for a few seconds after each
+`start`, `pause`, or `finish` event.
+
+Default behavior:
+
+```text
+first 10 processed frames -> learn background activity
+start command             -> begin feeding window
+after 45 seconds          -> compare last 10-frame average to threshold
+low activity              -> pause command
+after 120 seconds paused  -> start command
+after 2 allowed pauses    -> finish command on the next low-activity decision
+```
+
+Decision tuning flags:
+
+```bash
+--decision-mode on
+--decision-background-frames 10
+--decision-window-frames 10
+--decision-observe-seconds 45
+--decision-pause-seconds 120
+--decision-threshold-margin 0.5
+--decision-threshold-multiplier 1.2
+--decision-max-pauses 2
+--decision-machine-finish-second 0
+```
+
+The decision threshold is:
+
+```text
+max(background_score + decision_threshold_margin,
+    background_score * decision_threshold_multiplier)
 ```
 
 For repeatable experiments, prefer saving settings in `configs/` and writing

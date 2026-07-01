@@ -1,20 +1,17 @@
 # Feeding Activity Development Plan
 
-This project is moving from a single experimental script toward a deployable
-feeding-control pipeline. Keep `main` runnable, use short feature branches for
-code changes, and keep tuning experiments in configs/results rather than in
+This project has moved from a single experimental script into a package-based
+V1 activity pipeline. Keep `main` runnable, use short feature branches for code
+changes, and keep tuning experiments in configs/results rather than in
 long-lived branches.
 
 ## Branches
 
 - `main`: stable runnable code only.
-- `feature/no-flow-mode`: option to disable optical flow.
-- `refactor/pipeline-core`: package structure and behavior-preserving cleanup.
-- `feature/config-files`: load detector and decision settings from config files.
-- `feature/decision-engine`: feeding pause/stop/observe state machine.
-- `feature/supervised-detector`: neural-network detector inference path.
-- `feature/hybrid-detector`: combine supervised masks with image-processing
-  checks and scores.
+- `feature/decision-engine`: future feeding pause/stop/observe state machine.
+- `feature/supervised-detector`: future neural-network detector inference path.
+- `feature/hybrid-detector`: future combination of supervised masks with
+  image-processing checks and scores.
 - `experiment/*`: short-lived branches for risky code experiments. Do not keep
   one branch per threshold set.
 
@@ -22,12 +19,12 @@ long-lived branches.
 
 ```text
 fish_activity/
-  pipeline_v1.py          # current behavior, kept intact during first refactor
-  config.py               # future config loading and validation
-  video_io.py             # capture/writer adapters
+  pipeline_v1.py          # CLI orchestration for current V1 behavior
+  config.py               # config loading, validation against CLI options, presets
+  video_io.py             # writer adapters
   scoring.py              # activity score calculations
-  decision.py             # pause/stop/observe state machine
   render.py               # debug video overlays
+  decision.py             # local start/pause/finish state machine
   detectors/
     base.py               # common detector result interface
     unsupervised.py       # current anomaly/splash/motion methods
@@ -52,31 +49,35 @@ debug_maps
 metrics
 ```
 
-The decision engine should consume detector outputs and rolling-window metrics,
-not raw OpenCV internals.
+The decision engine consumes detector scores and rolling-window metrics, not raw
+OpenCV internals.
 
 ## Decision Engine
 
 Use a state machine rather than scattered threshold checks:
 
 ```text
-WARMUP -> FEEDING -> OBSERVE -> PAUSE -> STOP
+LEARNING -> FEEDING -> PAUSED -> FINISHED
 ```
 
-Decisions should be based on rolling windows:
+Current local behavior:
 
-- observe for a configured number of seconds before changing state
-- pause only after low activity persists
-- stop only after very low activity persists longer
-- resume only after activity rises above a higher threshold
+- learn background activity from the first configured number of processed frames
+- emit `start` after background learning
+- after each start, observe for a configured number of seconds before deciding
+- emit `pause` when the rolling activity average falls below the learned threshold
+- emit `start` again after the configured pause duration
+- emit `finish` after the configured pause limit is reached, or when an external
+  machine finish signal is supplied
 
-This avoids unstable pause/resume behavior.
+The command output is currently written to CSV/debug video. MQTT publishing and
+receiving can reuse the same command/state fields later.
 
 ## Refactor Order
 
-1. Preserve current behavior behind a package entrypoint.
-2. Add config loading and move detailed tuning values out of CLI defaults.
-3. Split detector/scoring/render modules without changing CSV semantics.
-4. Add decision state machine and state columns to CSV.
-5. Add supervised detector interface.
-6. Add hybrid detector.
+1. Done: preserve current behavior behind a package entrypoint.
+2. Done: add config loading and move repeatable tuning into configs.
+3. Done: split detector/scoring/render/video-IO modules without changing CSV semantics.
+4. Done: add local decision state machine and state columns to CSV.
+5. Future: add supervised detector interface.
+6. Future: add hybrid detector.

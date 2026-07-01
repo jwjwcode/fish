@@ -1,12 +1,13 @@
 {
   "decision": {
-    "warmup_seconds": 10,
-    "observe_seconds": 30,
-    "min_feed_seconds": 60,
-    "pause_threshold": 1.5,
-    "stop_threshold": 0.5,
-    "low_activity_seconds": 20,
-    "very_low_activity_seconds": 45,
-    "resume_threshold": 2.5
+    "decision_mode": "on",
+    "decision_background_frames": 10,
+    "decision_window_frames": 10,
+    "decision_observe_seconds": 45.0,
+    "decision_pause_seconds": 120.0,
+    "decision_threshold_margin": 0.5,
+    "decision_threshold_multiplier": 1.2,
+    "decision_max_pauses": 2,
+    "decision_machine_finish_second": 0.0
   }
 }
