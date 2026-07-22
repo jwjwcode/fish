@@ -1,0 +1,54 @@
+{
+  "resize_width": 1920,
+  "detector": {
+    "type": "unsupervised",
+    "preset": "current",
+    "seg_method": "anomaly",
+    "flow_method": "auto",
+    "flow_mask": "segmentation",
+    "artifact_filter": "on"
+  },
+  "segmentation": {
+    "anomaly_flow_foam_requires_texture": "on",
+    "splash_min_value": 155,
+    "splash_white_score": 114.0,
+    "splash_texture_threshold": 12.0,
+    "splash_edge_threshold": 20.0,
+    "anomaly_color_z": 2.9,
+    "anomaly_texture_z": 2.4,
+    "anomaly_flow_z": 2.6,
+    "anomaly_texture_flow_splash": "on",
+    "anomaly_texture_flow_flow_z": 1.8,
+    "anomaly_texture_flow_min_flow": 0.55,
+    "anomaly_texture_flow_min_texture": 7.5,
+    "anomaly_texture_flow_min_edge": 13.0,
+    "min_component_area": 45
+  },
+  "artifacts": {
+    "artifact_min_texture_mean": 18.0,
+    "artifact_min_edge_density": 0.08,
+    "artifact_min_flow_chaos": 0.55,
+    "artifact_max_bubble_area_pct": 0.60,
+    "artifact_min_reflection_area_pct": 0.25,
+    "artifact_persistence_frames": 3.0,
+    "artifact_static_new_ratio": 0.50,
+    "artifact_bright_min_value": 162.0,
+    "artifact_bright_min_white_score": 110.0,
+    "artifact_bright_max_texture_mean": 22.0,
+    "artifact_bright_max_edge_density": 0.12,
+    "artifact_bright_min_age": 2.0,
+    "artifact_static_max_flow_mean": 0.65,
+    "artifact_specular_min_area_pct": 0.05,
+    "artifact_specular_min_value": 172.0,
+    "artifact_specular_max_saturation": 105.0,
+    "artifact_specular_min_white_score": 116.0,
+    "artifact_specular_max_texture_mean": 30.0,
+    "artifact_specular_max_edge_density": 0.18,
+    "artifact_specular_max_texture_or_edge_density": 0.52,
+    "artifact_specular_max_flow_chaos": 1.05
+  },
+  "scoring": {
+    "seg_weight": 1.0,
+    "flow_weight": 0.025
+  }
+}

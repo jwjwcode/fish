@@ -92,6 +92,7 @@ class AdaptiveSplashSegmenter:
         edge = np.abs(cv2.Laplacian(roi_gray_blur, cv2.CV_32F, ksize=3))
 
         features = {
+            "saturation": saturation,
             "value": value,
             "white": white_score,
             "texture": texture,
@@ -176,11 +177,25 @@ class AdaptiveSplashSegmenter:
             texture_values = features["texture"][component]
             edge_values = features["edge"][component]
             flow_values = features["flow"][component]
+            saturation_values = features["saturation"][component]
+            value_values = features["value"][component]
+            white_values = features["white"][component]
 
             texture_mean = float(np.mean(texture_values)) if texture_values.size else 0.0
             edge_density = float(np.mean(edge_values >= self.args.splash_edge_threshold))
+            texture_or_edge_density = float(
+                np.mean(
+                    (texture_values >= self.args.splash_texture_threshold)
+                    | (edge_values >= self.args.splash_edge_threshold)
+                )
+            )
             flow_mean = float(np.mean(flow_values)) if flow_values.size else 0.0
             flow_std = float(np.std(flow_values)) if flow_values.size else 0.0
+            saturation_mean = (
+                float(np.mean(saturation_values)) if saturation_values.size else 0.0
+            )
+            value_mean = float(np.mean(value_values)) if value_values.size else 0.0
+            white_mean = float(np.mean(white_values)) if white_values.size else 0.0
             flow_chaos = flow_std / (flow_mean + 1e-6)
             prev_overlap = float(np.mean(prev_mask[component]))
             new_ratio = 1.0 - prev_overlap
@@ -198,6 +213,36 @@ class AdaptiveSplashSegmenter:
                 mean_age >= self.args.artifact_persistence_frames
                 and new_ratio <= self.args.artifact_static_new_ratio
             )
+            bright_white = (
+                value_mean >= self.args.artifact_bright_min_value
+                and white_mean >= self.args.artifact_bright_min_white_score
+            )
+            smooth_bright = (
+                bright_white
+                and texture_mean <= self.args.artifact_bright_max_texture_mean
+                and edge_density <= self.args.artifact_bright_max_edge_density
+            )
+            static_like_bright = (
+                mean_age >= self.args.artifact_bright_min_age
+                or new_ratio <= self.args.artifact_static_new_ratio
+                or flow_mean <= self.args.artifact_static_max_flow_mean
+            )
+            specular_bright = (
+                value_mean >= self.args.artifact_specular_min_value
+                and saturation_mean <= self.args.artifact_specular_max_saturation
+                and white_mean >= self.args.artifact_specular_min_white_score
+            )
+            weak_texture_support = (
+                texture_mean <= self.args.artifact_specular_max_texture_mean
+                and edge_density <= self.args.artifact_specular_max_edge_density
+                and texture_or_edge_density
+                <= self.args.artifact_specular_max_texture_or_edge_density
+            )
+            specular_motion_is_not_splash_like = (
+                flow_chaos <= self.args.artifact_specular_max_flow_chaos
+                or mean_age >= self.args.artifact_bright_min_age
+                or new_ratio <= self.args.artifact_static_new_ratio
+            )
 
             reject_ripple_like = smooth_texture and coherent_flow and new_ratio < 0.65
             reject_persistent_bubble = (
@@ -205,18 +250,47 @@ class AdaptiveSplashSegmenter:
                 and area_pct <= self.args.artifact_max_bubble_area_pct
                 and (coherent_flow or smooth_texture)
             )
+            reject_smooth_bright_bubble = (
+                area_pct <= self.args.artifact_max_bubble_area_pct
+                and smooth_bright
+                and static_like_bright
+            )
             reject_smooth_reflection = (
                 persistent_static
                 and area_pct >= self.args.artifact_min_reflection_area_pct
                 and smooth_texture
             )
+            reject_smooth_bright_reflection = (
+                area_pct >= self.args.artifact_min_reflection_area_pct
+                and smooth_bright
+                and static_like_bright
+            )
+            reject_smooth_bright_artifact = (
+                smooth_bright
+                and static_like_bright
+                and (area_pct >= self.args.artifact_min_reflection_area_pct * 0.25)
+            )
+            reject_specular_reflection = (
+                area_pct >= self.args.artifact_specular_min_area_pct
+                and specular_bright
+                and weak_texture_support
+                and specular_motion_is_not_splash_like
+            )
 
-            if reject_ripple_like or reject_persistent_bubble or reject_smooth_reflection:
+            if (
+                reject_ripple_like
+                or reject_persistent_bubble
+                or reject_smooth_bright_bubble
+                or reject_smooth_reflection
+                or reject_smooth_bright_reflection
+                or reject_smooth_bright_artifact
+                or reject_specular_reflection
+            ):
                 continue
 
             filtered[component] = 255
 
-        self._update_artifact_state(filtered)
+        self._update_artifact_state(mask)
         return filtered
 
     def compute(
@@ -269,12 +343,30 @@ class AdaptiveSplashSegmenter:
             (z_flow >= self.args.anomaly_flow_z)
             & (features["flow"] >= self.args.anomaly_min_flow)
         )
+        texture_flow_splash = np.zeros_like(flow_anomaly, dtype=bool)
+        if self.args.anomaly_texture_flow_splash == "on":
+            texture_flow_motion = (
+                (z_flow >= self.args.anomaly_texture_flow_flow_z)
+                & (features["flow"] >= self.args.anomaly_texture_flow_min_flow)
+            )
+            texture_flow_structure = (
+                texture_anomaly
+                & (
+                    (features["texture"] >= self.args.anomaly_texture_flow_min_texture)
+                    | (features["edge"] >= self.args.anomaly_texture_flow_min_edge)
+                )
+            )
+            texture_flow_splash = texture_flow_structure & texture_flow_motion
         motion_support = fg_mask | diff_mask | flow_anomaly
+        flow_supported_foam = absolute_foam & flow_anomaly
+        if self.args.anomaly_flow_foam_requires_texture == "on":
+            flow_supported_foam &= absolute_texture | texture_anomaly
 
         mask_bool = (
             (absolute_foam & absolute_texture & motion_support)
             | (color_anomaly & texture_anomaly & motion_support)
-            | (absolute_foam & flow_anomaly)
+            | flow_supported_foam
+            | texture_flow_splash
         )
 
         mask = (mask_bool.astype(np.uint8)) * 255

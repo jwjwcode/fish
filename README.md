@@ -29,7 +29,9 @@ intended to suppress smooth wind ripples.
 The current preset also applies component-level artifact filtering after
 segmentation. It removes components that look like smooth/coherent ripple,
 persistent sunlight reflection, or small persistent white bubbles using
-component texture, edge density, flow chaos, and temporal persistence.
+component texture, edge density, flow chaos, temporal persistence, and smooth
+bright/white appearance. White regions supported only by flow must also have
+texture/edge support by default, which helps reject smooth sunlight reflection.
 
 By default, `optical_flow_activity` is a splash-flow energy score: optical flow
 inside the segmentation mask, weighted by mask area. This suppresses ripple-only
@@ -51,6 +53,8 @@ python3 -m pip install -r requirements.txt
 
 ```text
 scripts/feeding_activity_v1.py       # compatibility CLI wrapper
+scripts/feeding_activity_mqtt_runtime.py
+scripts/feeding_activity_mqtt_multistream_runtime.py
 fish_activity/pipeline_v1.py         # V1 CLI orchestration
 fish_activity/config.py              # config loading and presets
 fish_activity/detectors/base.py      # common detector result contract
@@ -59,6 +63,9 @@ fish_activity/scoring.py             # activity score calculations
 fish_activity/render.py              # debug video overlays
 fish_activity/video_io.py            # video writer helpers
 fish_activity/decision.py            # local feeding start/pause/finish logic
+fish_activity/mqtt_io.py             # MQTT camera/command/final-score helpers
+fish_activity/mqtt_runtime.py        # single-stream MQTT runtime
+fish_activity/mqtt_multistream_runtime.py
 configs/                             # reproducible tuning/deployment settings
 docs/development_plan.md             # branch/refactor roadmap
 ```
@@ -73,7 +80,10 @@ docs/development_plan.md             # branch/refactor roadmap
 This writes:
 
 - `A6_20260506T161254_abw722_biomass14944_feed12_feedcap12_feedremaining-0_score5_activity_v1.mp4`
-- `A6_20260506T161254_abw722_biomass14944_feed12_feedcap12_feedremaining-0_score5_activity_v1.csv`
+- `A6_20260506T161254_abw722_biomass14944_feed12_feedcap12_feedremaining-0_score5_activity_v1.xlsx`
+
+Add `--csv debug.csv` only when you need the full debug CSV and sidecar
+metadata JSON.
 
 For a quick short test:
 
@@ -94,6 +104,7 @@ To run from a repeatable config:
 
 Config keys use the same names as CLI options, without the leading `--`. Nested
 sections are allowed; command-line flags override matching config values.
+Unknown config keys fail fast so typos do not silently change an experiment.
 
 ## Presets
 
@@ -144,15 +155,96 @@ Useful tuning flags:
 --flow-method farneback  # compare against the fallback optical-flow method
 --flow-mask none         # use raw optical flow instead of segmentation-masked flow
 --artifact-filter off    # disable ripple/reflection/bubble component filtering
+--anomaly-flow-foam-requires-texture on
+--artifact-bright-min-value 165
+--artifact-bright-min-white-score 110
+--artifact-bright-max-texture-mean 18
+--artifact-bright-max-edge-density 0.08
+--artifact-bright-min-age 3
+--artifact-static-max-flow-mean 0.45
+--artifact-specular-min-area-pct 0.05
+--artifact-specular-min-value 172
+--artifact-specular-max-saturation 105
+--artifact-specular-max-texture-or-edge-density 0.52
+--anomaly-texture-flow-splash on
+--anomaly-texture-flow-min-texture 7.5
+--anomaly-texture-flow-min-edge 13
+--anomaly-texture-flow-min-flow 0.55
 --seg-weight 1           # segmentation contribution to total_activity
 --flow-weight 0.03       # optical-flow contribution to total_activity
+--log-level INFO         # DEBUG, INFO, WARNING, or ERROR
+--progress-interval 100  # log every N processed frames, 0 disables progress logs
 ```
+
+## Reproducibility
+
+When `--csv` is provided, the run writes reproducibility metadata into each CSV
+row:
+
+```text
+run_id
+run_started_utc
+code_version
+git_commit
+input_path
+config_path
+```
+
+It also writes a sidecar metadata file next to the CSV:
+
+```text
+<csv_stem>.metadata.json
+```
+
+This records the run id, git commit, input/output paths, config path, and a
+compact settings snapshot.
+
+Each run writes a compact Excel workbook next to the output video by default.
+Use `--excel path/to/scores.xlsx` to choose a different path. The `scores` sheet
+contains only:
+
+```text
+time_s
+current_segmentation_score
+current_optical_flow_score
+current_total_activity
+previous_10_total_activity_average
+```
+
+The `summary` sheet stores the final feeding score after the full run.
+
+## Tests
+
+Run the test suite with:
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+The tests cover decision logic, config validation/CLI override behavior, and
+core scoring behavior.
+
+Artifact tuning configs:
+
+```bash
+--config configs/tune_sun_reflection.json
+--config configs/tune_less_reflection.json
+--config configs/tune_less_bubble.json
+--config configs/tune_strict_splash.json
+```
+
+Use `tune_sun_reflection` when smooth specular glare is the main false positive,
+use `tune_less_reflection` for a milder reflection setting, use
+`tune_less_bubble` when persistent white bubbles are over-segmented, and use
+`tune_strict_splash` when false positives are more costly than missing weak
+splash.
 
 ## Feeding decision logic
 
 The V1 pipeline now includes local command logic for control experiments. It
-does not publish MQTT yet; it writes command/state fields to the CSV and debug
-video. The annotated video shows the current command, the last command with its
+writes command/state fields to the CSV/debug video and can publish commands
+through the MQTT runtime. The annotated video shows the current command, the
+last command with its
 timestamp, and a highlighted bottom-strip banner for a few seconds after each
 `start`, `pause`, or `finish` event.
 
@@ -186,6 +278,100 @@ The decision threshold is:
 ```text
 max(background_score + decision_threshold_margin,
     background_score * decision_threshold_multiplier)
+```
+
+## MQTT runtime
+
+The deployment runtime follows the AF/AI pond protocol. `<pond_id>` is one of
+`A1`-`A8`, `B1`-`B8`, or `C1`-`C8`.
+
+| Topic | Direction | Payload |
+| --- | --- | --- |
+| `/AI/<pond_id>/init` | AF -> AI | `{"IP":"192.168.46.24:8080","BM":12500.0,"ABW":750.0,"FC":150.0}` |
+| `/AI/<pond_id>/control` | AI -> AF | `{"command":"START"}`, `{"command":"PAUSE"}`, `{"command":"STOP"}` |
+| `/AI/<pond_id>/status` | AF -> AI | `{"state":"FEED_STARTED"}`, `{"state":"Paused"}`, `{"state":"Last_Pause"}`, `{"state":"SCORED"}` |
+| `/AI/<pond_id>/score` | AI -> AF | `{"score":8.0}` |
+
+Sequence:
+
+```text
+AF init -> AI START/PAUSE decisions -> AF Last_Pause -> AI score
+-> AF SCORED -> AI STOP -> AF next init
+```
+
+If `IP` is already a full `rtsp://`, `rtmp://`, `http://`, or `https://` URL, it
+is used directly. Otherwise the runtime applies `--camera-url-template`.
+
+Example:
+
+```bash
+.venv/bin/python scripts/feeding_activity_mqtt_runtime.py \
+  --mqtt-host 192.168.1.100 \
+  --camera-url-template 'rtsp://{ip}/stream1' \
+  -- \
+  --config configs/tune_less_bubble.json \
+  --headless on \
+  --csv results/runtime/latest.csv \
+  --duration 0
+```
+
+Pipeline options go after `--`. The MQTT runtime defaults to headless mode if
+`--headless` is not provided. The final score is the average `total_activity`
+across all processed frames in that feeding run.
+
+Manual local MQTT test:
+
+```bash
+mosquitto_sub -h localhost -t '/AI/#' -v
+```
+
+In another terminal, start one runtime run against a local video path:
+
+```bash
+.venv/bin/python scripts/feeding_activity_mqtt_runtime.py \
+  --mqtt-host localhost \
+  --max-runs 1 \
+  --camera-url-template '{ip}' \
+  -- \
+  --config configs/tune_less_bubble.json \
+  --headless on \
+  --csv results/mqtt_manual/A4.csv
+```
+
+Then simulate AF messages:
+
+```bash
+mosquitto_pub -h localhost -t /AI/A4/init -m '{"IP":"videos/example.mp4","BM":12500.0,"ABW":750.0,"FC":150.0}'
+mosquitto_pub -h localhost -t /AI/A4/status -m '{"state":"Last_Pause"}'
+mosquitto_pub -h localhost -t /AI/A4/status -m '{"state":"SCORED"}'
+```
+
+Expected AI messages are `{"command":"START"}` on `/AI/A4/control`, then
+`{"score":...}` on `/AI/A4/score`, then `{"command":"STOP"}` on
+`/AI/A4/control` after `SCORED`.
+
+Useful runtime safety flags:
+
+```bash
+--camera-read-fail-limit 30
+--command-error-policy log
+```
+
+Use `--command-error-policy stop` if a failed MQTT command publish should stop
+the pipeline.
+
+For four-stream deployment, use the multi-stream runtime. It accepts AF init
+messages, keeps up to four worker processes active, and starts a replacement
+when AF sends the next init after a worker publishes `STOP`.
+
+```bash
+.venv/bin/python scripts/feeding_activity_mqtt_multistream_runtime.py \
+  --mqtt-host 192.168.1.100 \
+  --max-streams 4 \
+  --camera-url-template 'rtsp://{ip}/stream1' \
+  -- \
+  --config configs/tune_less_bubble.json \
+  --duration 0
 ```
 
 For repeatable experiments, prefer saving settings in `configs/` and writing

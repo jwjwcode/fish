@@ -1,0 +1,40 @@
+{
+  "resize_width": 2560,
+  "detector": {
+    "type": "unsupervised",
+    "preset": "current",
+    "seg_method": "anomaly",
+    "flow_method": "auto",
+    "flow_mask": "segmentation",
+    "artifact_filter": "on"
+  },
+  "segmentation": {
+    "anomaly_flow_foam_requires_texture": "on",
+    "splash_min_value": 155,
+    "splash_white_score": 112.0,
+    "splash_texture_threshold": 12.0,
+    "splash_edge_threshold": 20.0,
+    "anomaly_color_z": 2.9,
+    "anomaly_texture_z": 2.5,
+    "anomaly_flow_z": 2.6,
+    "min_component_area": 60
+  },
+  "artifacts": {
+    "artifact_min_texture_mean": 18.0,
+    "artifact_min_edge_density": 0.08,
+    "artifact_max_bubble_area_pct": 0.60,
+    "artifact_min_reflection_area_pct": 0.30,
+    "artifact_persistence_frames": 3.0,
+    "artifact_static_new_ratio": 0.45,
+    "artifact_bright_min_value": 165.0,
+    "artifact_bright_min_white_score": 112.0,
+    "artifact_bright_max_texture_mean": 20.0,
+    "artifact_bright_max_edge_density": 0.10,
+    "artifact_bright_min_age": 2.0,
+    "artifact_static_max_flow_mean": 0.60
+  },
+  "scoring": {
+    "seg_weight": 1.0,
+    "flow_weight": 0.03
+  }
+}

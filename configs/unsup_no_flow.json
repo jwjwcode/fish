@@ -8,6 +8,25 @@
     "flow_mask": "none",
     "artifact_filter": "on"
   },
+  "segmentation": {
+    "anomaly_flow_foam_requires_texture": "on"
+  },
+  "artifacts": {
+    "artifact_bright_min_value": 165.0,
+    "artifact_bright_min_white_score": 110.0,
+    "artifact_bright_max_texture_mean": 18.0,
+    "artifact_bright_max_edge_density": 0.08,
+    "artifact_bright_min_age": 3.0,
+    "artifact_static_max_flow_mean": 0.45,
+    "artifact_specular_min_area_pct": 0.12,
+    "artifact_specular_min_value": 185.0,
+    "artifact_specular_max_saturation": 85.0,
+    "artifact_specular_min_white_score": 130.0,
+    "artifact_specular_max_texture_mean": 24.0,
+    "artifact_specular_max_edge_density": 0.14,
+    "artifact_specular_max_texture_or_edge_density": 0.45,
+    "artifact_specular_max_flow_chaos": 0.75
+  },
   "scoring": {
     "seg_weight": 1.0,
     "flow_weight": 0.0

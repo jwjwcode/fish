@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+import logging
 import sys
+import time
 from collections import deque
 from pathlib import Path
+from typing import Any, Callable
 
 try:
     import cv2
@@ -22,12 +26,23 @@ except ModuleNotFoundError as exc:  # pragma: no cover - user-facing startup gua
         f"{exc.name}\nInstall dependencies with: python3 -m pip install -r requirements.txt"
     ) from exc
 
-from fish_activity.config import apply_preset, load_config_values, provided_cli_dests
+from fish_activity.config import (
+    apply_preset,
+    load_config_values,
+    provided_cli_dests,
+    validate_args,
+)
 from fish_activity.decision import DecisionConfig, FeedingDecisionEngine
 from fish_activity.detectors.unsupervised import (
     UnsupervisedSplashDetector,
     compute_flow_magnitude,
     create_flow_estimator,
+)
+from fish_activity.excel_io import write_score_workbook
+from fish_activity.metadata import (
+    build_run_metadata,
+    csv_metadata_fields,
+    csv_metadata_values,
 )
 from fish_activity.render import (
     bottom_panel_layout,
@@ -36,10 +51,11 @@ from fish_activity.render import (
     roi_bounds,
 )
 from fish_activity.scoring import average_score_history, score_flow
-from fish_activity.video_io import open_writer
+from fish_activity.video_io import is_stream_source, open_writer, source_name
 
 
 CSV_FIELDNAMES = [
+    *csv_metadata_fields(),
     "processed_frame",
     "source_frame",
     "time_s",
@@ -74,6 +90,12 @@ CSV_FIELDNAMES = [
     "feeding_finish_reason",
 ]
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOGGER = logging.getLogger(__name__)
+DecisionCommandSink = Callable[[dict[str, Any]], None]
+FinalScoreSink = Callable[[dict[str, Any]], None]
+SystemFinishChecker = Callable[[], bool]
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if argv is None:
@@ -81,7 +103,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create annotated fish-feeding activity video from one input video."
     )
-    parser.add_argument("input", type=Path, help="Input video path.")
+    parser.add_argument(
+        "input",
+        help="Input video path or stream URL. MQTT runtime can provide this from a camera IP.",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -99,13 +124,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="Output annotated video path. Default: <input_stem>_activity_v1.mp4",
+        help="Output annotated video path. Default: <input_stem>_activity_v1.mp4. Ignored when --headless on.",
     )
     parser.add_argument(
         "--csv",
         type=Path,
         default=None,
-        help="Output CSV path. Default: <output_stem>.csv",
+        help="Optional full debug CSV path. Omit to write only video and Excel outputs.",
+    )
+    parser.add_argument(
+        "--excel",
+        type=Path,
+        default=None,
+        help="Output Excel score summary path. Default: <output_stem>.xlsx",
     )
     parser.add_argument(
         "--resize-width",
@@ -134,8 +165,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--preview-width",
         type=int,
-        default=420,
-        help="Width of each preview panel in the annotated video.",
+        default=0,
+        help="Width of each preview panel in the annotated video. Use 0 to auto-fill the available area.",
     )
     parser.add_argument(
         "--warmup-frames",
@@ -252,6 +283,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Minimum optical-flow magnitude for flow anomaly support.",
     )
     parser.add_argument(
+        "--anomaly-flow-foam-requires-texture",
+        choices=("on", "off"),
+        default="on",
+        help="Require texture/edge support for white foam that is detected only by optical-flow anomaly.",
+    )
+    parser.add_argument(
+        "--anomaly-texture-flow-splash",
+        choices=("on", "off"),
+        default="off",
+        help="Recover non-white splash using local texture/edge anomaly plus optical-flow anomaly.",
+    )
+    parser.add_argument(
+        "--anomaly-texture-flow-flow-z",
+        type=float,
+        default=2.0,
+        help="Flow z-score threshold for non-white texture+flow splash recovery.",
+    )
+    parser.add_argument(
+        "--anomaly-texture-flow-min-flow",
+        type=float,
+        default=0.8,
+        help="Minimum optical-flow magnitude for non-white texture+flow splash recovery.",
+    )
+    parser.add_argument(
+        "--anomaly-texture-flow-min-texture",
+        type=float,
+        default=8.0,
+        help="Minimum local texture for non-white texture+flow splash recovery.",
+    )
+    parser.add_argument(
+        "--anomaly-texture-flow-min-edge",
+        type=float,
+        default=14.0,
+        help="Minimum local edge strength for non-white texture+flow splash recovery.",
+    )
+    parser.add_argument(
         "--artifact-filter",
         choices=("on", "off"),
         default=None,
@@ -300,6 +367,90 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Large smooth components over this ROI area percent can be treated as reflections.",
     )
     parser.add_argument(
+        "--artifact-bright-min-value",
+        type=float,
+        default=165.0,
+        help="Mean HSV value above which smooth components are treated as bright artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-bright-min-white-score",
+        type=float,
+        default=110.0,
+        help="Mean whiteness score above which smooth components are treated as bright artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-bright-max-texture-mean",
+        type=float,
+        default=18.0,
+        help="Maximum mean texture for smooth bright artifact rejection.",
+    )
+    parser.add_argument(
+        "--artifact-bright-max-edge-density",
+        type=float,
+        default=0.08,
+        help="Maximum edge density for smooth bright artifact rejection.",
+    )
+    parser.add_argument(
+        "--artifact-bright-min-age",
+        type=float,
+        default=3.0,
+        help="Mean per-pixel age after which smooth bright components are treated as static artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-static-max-flow-mean",
+        type=float,
+        default=0.45,
+        help="Mean flow below which smooth bright components can be treated as static artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-specular-min-area-pct",
+        type=float,
+        default=0.12,
+        help="Minimum ROI area percent for smooth specular reflection rejection.",
+    )
+    parser.add_argument(
+        "--artifact-specular-min-value",
+        type=float,
+        default=185.0,
+        help="Mean HSV value above which a component can be treated as specular reflection.",
+    )
+    parser.add_argument(
+        "--artifact-specular-max-saturation",
+        type=float,
+        default=85.0,
+        help="Mean HSV saturation below which a component can be treated as specular reflection.",
+    )
+    parser.add_argument(
+        "--artifact-specular-min-white-score",
+        type=float,
+        default=130.0,
+        help="Mean whiteness score above which a component can be treated as specular reflection.",
+    )
+    parser.add_argument(
+        "--artifact-specular-max-texture-mean",
+        type=float,
+        default=24.0,
+        help="Maximum mean texture for smooth specular reflection rejection.",
+    )
+    parser.add_argument(
+        "--artifact-specular-max-edge-density",
+        type=float,
+        default=0.14,
+        help="Maximum edge density for smooth specular reflection rejection.",
+    )
+    parser.add_argument(
+        "--artifact-specular-max-texture-or-edge-density",
+        type=float,
+        default=0.45,
+        help="Maximum strong texture/edge pixel ratio for smooth specular reflection rejection.",
+    )
+    parser.add_argument(
+        "--artifact-specular-max-flow-chaos",
+        type=float,
+        default=0.75,
+        help="Maximum flow variation ratio for coherent specular reflection motion.",
+    )
+    parser.add_argument(
         "--min-component-area",
         type=int,
         default=30,
@@ -345,6 +496,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--codec",
         default="mp4v",
         help="FourCC codec for the output video.",
+    )
+    parser.add_argument(
+        "--headless",
+        choices=("on", "off"),
+        default="off",
+        help="Disable annotated-video writing for deployment/runtime use.",
+    )
+    parser.add_argument(
+        "--stop-after-finish",
+        choices=("on", "off"),
+        default="off",
+        help="Stop processing after the local decision engine emits a finish command.",
+    )
+    parser.add_argument(
+        "--camera-read-fail-limit",
+        type=int,
+        default=30,
+        help="Stop after this many consecutive failed frame reads. Use 0 to retry forever.",
+    )
+    parser.add_argument(
+        "--command-error-policy",
+        choices=("log", "stop"),
+        default="log",
+        help="What to do if an external command publisher fails.",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Runtime log verbosity.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=100,
+        help="Log progress every N processed frames. Use 0 to disable progress logs.",
     )
     parser.add_argument(
         "--decision-mode",
@@ -406,22 +593,103 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for dest, value in config_values.items():
         if dest not in provided_dests:
             setattr(args, dest, value)
-    return apply_preset(args)
+    args = apply_preset(args)
+    validate_args(args)
+    return args
 
 
-def main() -> int:
-    args = parse_args()
-    if args.frame_step < 1:
-        raise SystemExit("--frame-step must be >= 1")
-    if not args.input.exists():
-        raise SystemExit(f"Input video does not exist: {args.input}")
+def setup_logging(log_level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
-    output = args.output or args.input.with_name(f"{args.input.stem}_activity_v1.mp4")
-    csv_output = args.csv or output.with_suffix(".csv")
 
-    cap = cv2.VideoCapture(str(args.input))
+def default_output_paths(
+    args: argparse.Namespace,
+) -> tuple[Path | None, Path | None, Path]:
+    stem = f"{source_name(args.input)}_activity_v1"
+    if is_stream_source(args.input):
+        base_output = Path(f"{stem}.mp4")
+    else:
+        input_path = Path(str(args.input))
+        base_output = input_path.with_name(f"{stem}.mp4")
+    if args.headless == "on":
+        output = args.output
+    else:
+        output = args.output or base_output
+    csv_output = args.csv
+    if args.excel is not None:
+        excel_output = args.excel
+    elif output is not None:
+        excel_output = output.with_suffix(".xlsx")
+    elif csv_output is not None:
+        excel_output = csv_output.with_suffix(".xlsx")
+    else:
+        excel_output = base_output.with_suffix(".xlsx")
+    return output, csv_output, excel_output
+
+
+def publish_decision_command(
+    command_sink: DecisionCommandSink | None,
+    payload: dict[str, Any],
+    error_policy: str,
+) -> None:
+    if command_sink is None:
+        return
+    try:
+        command_sink(payload)
+    except Exception:
+        LOGGER.exception("decision command publish failed")
+        if error_policy == "stop":
+            raise
+
+
+def publish_final_score(
+    final_score_sink: FinalScoreSink | None,
+    payload: dict[str, Any],
+    error_policy: str,
+) -> None:
+    if final_score_sink is None:
+        return
+    try:
+        final_score_sink(payload)
+    except Exception:
+        LOGGER.exception("final score publish failed")
+        if error_policy == "stop":
+            raise
+
+
+def final_score_payload(
+    final_score: float,
+) -> dict[str, float]:
+    return {
+        "final_feeding_score": final_score,
+    }
+
+
+def run_pipeline(
+    args: argparse.Namespace,
+    command_sink: DecisionCommandSink | None = None,
+    final_score_sink: FinalScoreSink | None = None,
+    system_finish_checker: SystemFinishChecker | None = None,
+) -> int:
+    input_source = str(args.input)
+    if not is_stream_source(input_source) and not Path(input_source).exists():
+        raise SystemExit(f"Input video does not exist: {input_source}")
+
+    output, csv_output, excel_output = default_output_paths(args)
+    metadata_output = (
+        csv_output.with_suffix(".metadata.json") if csv_output is not None else None
+    )
+    run_metadata = build_run_metadata(args, PROJECT_ROOT)
+    run_metadata["output_video_path"] = str(output or "")
+    run_metadata["csv_path"] = str(csv_output or "")
+    run_metadata["excel_path"] = str(excel_output)
+
+    cap = cv2.VideoCapture(input_source)
     if not cap.isOpened():
-        raise SystemExit(f"Could not open input video: {args.input}")
+        raise SystemExit(f"Could not open input video/source: {input_source}")
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     if fps <= 0:
@@ -441,23 +709,51 @@ def main() -> int:
         height,
         args.preview_width,
     )
-    writer = open_writer(output, output_fps, (width, height + panel_height), args.codec)
+    writer = None
+    if args.headless == "off":
+        assert output is not None
+        writer = open_writer(output, output_fps, (width, height + panel_height), args.codec)
 
     detector = UnsupervisedSplashDetector(args)
     flow_estimator, flow_method = create_flow_estimator(args.flow_method)
     decision_engine = FeedingDecisionEngine(DecisionConfig.from_args(args))
     machine_finish_sent = False
 
-    csv_output.parent.mkdir(parents=True, exist_ok=True)
-    csv_file = csv_output.open("w", newline="")
-    csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES)
-    csv_writer.writeheader()
+    csv_file = None
+    csv_writer: csv.DictWriter | None = None
+    csv_metadata: dict[str, str] = {}
+    if csv_output is not None:
+        csv_output.parent.mkdir(parents=True, exist_ok=True)
+        assert metadata_output is not None
+        metadata_output.parent.mkdir(parents=True, exist_ok=True)
+        with metadata_output.open("w") as metadata_file:
+            json.dump(run_metadata, metadata_file, indent=2, sort_keys=True)
+            metadata_file.write("\n")
+
+        csv_file = csv_output.open("w", newline="")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES)
+        csv_writer.writeheader()
+        csv_metadata = csv_metadata_values(run_metadata)
+
+    LOGGER.info(
+        "started run_id=%s input=%s output=%s excel=%s csv=%s config=%s",
+        run_metadata["run_id"],
+        args.input,
+        output,
+        excel_output,
+        csv_output,
+        args.config or "",
+    )
 
     prev_gray_blur: np.ndarray | None = None
     score_history: deque[dict[str, float]] = deque(maxlen=10)
     processed_index = 0
     source_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
     max_end_time = args.start_second + args.duration if args.duration > 0 else None
+    consecutive_read_failures = 0
+    all_score_sum = 0.0
+    all_score_count = 0
+    compact_score_rows: list[dict[str, float]] = []
 
     try:
         while True:
@@ -500,100 +796,136 @@ def main() -> int:
                 seg_score = args.seg_weight * seg_activity_pct
                 flow_score = args.flow_weight * flow_activity
                 total_activity = seg_score + flow_score
+                all_score_sum += total_activity
+                all_score_count += 1
                 score_averages = average_score_history(score_history)
-                time_s = args.start_second + (processed_index * args.frame_step / fps)
+                time_s = processed_index / output_fps
+                compact_score_rows.append(
+                    {
+                        "time_s": time_s,
+                        "current_segmentation_score": seg_score,
+                        "current_optical_flow_score": flow_score,
+                        "current_total_activity": total_activity,
+                        "previous_10_total_activity_average": score_averages[
+                            "total_activity_prev10_avg"
+                        ],
+                    }
+                )
                 external_command = None
+                system_finish_received = (
+                    system_finish_checker() if system_finish_checker is not None else False
+                )
                 if (
                     args.decision_machine_finish_second > 0
                     and not machine_finish_sent
                     and time_s >= args.decision_machine_finish_second
                 ):
-                    external_command = "finish"
+                    system_finish_received = True
                     machine_finish_sent = True
+                if system_finish_received:
+                    external_command = "finish"
                 decision = decision_engine.update(
                     time_s,
                     total_activity,
                     external_command=external_command,
                 )
 
-                annotated = overlay_visuals(
-                    frame,
-                    x0,
-                    x1,
-                    mask,
-                    flow_mag,
-                    {
-                        "seg_activity_pct": seg_activity_pct,
-                        "seg_score": seg_score,
-                        "flow_activity": flow_activity,
-                        "flow_score": flow_score,
-                        "raw_flow_activity": raw_flow_activity,
-                        "total_activity": total_activity,
-                        "total_activity_prev10_avg": score_averages[
-                            "total_activity_prev10_avg"
-                        ],
-                        "feeding_state": decision.state,
-                        "feeding_command": decision.command,
-                        "last_feeding_command": decision.last_command,
-                        "last_feeding_command_time_s": decision.last_command_time_s,
-                        "decision_window_avg": decision.window_avg,
-                        "decision_threshold": decision.threshold,
-                        "feeding_process_score": decision.process_score,
-                    },
-                    time_s,
-                    preview_width,
-                    panel_height,
-                    text_area_width,
-                )
-                writer.write(annotated)
-                csv_writer.writerow(
-                    {
-                        "processed_frame": processed_index,
-                        "source_frame": source_frame_index,
-                        "time_s": f"{time_s:.6f}",
-                        "roi_x0": x0,
-                        "roi_x1": x1,
-                        "preset": args.preset,
-                        "seg_method": args.seg_method,
-                        "flow_method": flow_method,
-                        "flow_mask": args.flow_mask,
-                        "artifact_filter": args.artifact_filter,
-                        "seg_weight": f"{args.seg_weight:.6f}",
-                        "flow_weight": f"{args.flow_weight:.6f}",
-                        "segmentation_activity_pct": f"{seg_activity_pct:.6f}",
-                        "segmentation_score": f"{seg_score:.6f}",
-                        "optical_flow_activity": f"{flow_activity:.6f}",
-                        "optical_flow_score": f"{flow_score:.6f}",
-                        "optical_flow_raw_activity": f"{raw_flow_activity:.6f}",
-                        "total_activity": f"{total_activity:.6f}",
-                        "previous_10_frame_count": (
-                            f"{int(score_averages['previous_10_frame_count'])}"
-                        ),
-                        "segmentation_score_prev10_avg": (
-                            f"{score_averages['segmentation_score_prev10_avg']:.6f}"
-                        ),
-                        "optical_flow_score_prev10_avg": (
-                            f"{score_averages['optical_flow_score_prev10_avg']:.6f}"
-                        ),
-                        "total_activity_prev10_avg": (
-                            f"{score_averages['total_activity_prev10_avg']:.6f}"
-                        ),
-                        "feeding_state": decision.state,
-                        "feeding_command": decision.command,
-                        "last_feeding_command": decision.last_command,
-                        "last_feeding_command_time_s": (
-                            f"{decision.last_command_time_s:.6f}"
-                        ),
-                        "decision_window_avg": f"{decision.window_avg:.6f}",
-                        "decision_background_score": (
-                            f"{decision.background_score:.6f}"
-                        ),
-                        "decision_threshold": f"{decision.threshold:.6f}",
-                        "decision_pause_count": decision.pause_count,
-                        "feeding_process_score": f"{decision.process_score:.6f}",
-                        "feeding_finish_reason": decision.finish_reason,
-                    }
-                )
+                if writer is not None:
+                    annotated = overlay_visuals(
+                        frame,
+                        x0,
+                        x1,
+                        mask,
+                        flow_mag,
+                        {
+                            "seg_activity_pct": seg_activity_pct,
+                            "seg_score": seg_score,
+                            "flow_activity": flow_activity,
+                            "flow_score": flow_score,
+                            "raw_flow_activity": raw_flow_activity,
+                            "total_activity": total_activity,
+                            "total_activity_prev10_avg": score_averages[
+                                "total_activity_prev10_avg"
+                            ],
+                            "feeding_state": decision.state,
+                            "feeding_command": decision.command,
+                            "last_feeding_command": decision.last_command,
+                            "last_feeding_command_time_s": decision.last_command_time_s,
+                            "decision_window_avg": decision.window_avg,
+                            "decision_threshold": decision.threshold,
+                            "feeding_process_score": decision.process_score,
+                        },
+                        time_s,
+                        preview_width,
+                        panel_height,
+                        text_area_width,
+                    )
+                    writer.write(annotated)
+                if csv_writer is not None:
+                    csv_writer.writerow(
+                        {
+                            **csv_metadata,
+                            "processed_frame": processed_index,
+                            "source_frame": source_frame_index,
+                            "time_s": f"{time_s:.6f}",
+                            "roi_x0": x0,
+                            "roi_x1": x1,
+                            "preset": args.preset,
+                            "seg_method": args.seg_method,
+                            "flow_method": flow_method,
+                            "flow_mask": args.flow_mask,
+                            "artifact_filter": args.artifact_filter,
+                            "seg_weight": f"{args.seg_weight:.6f}",
+                            "flow_weight": f"{args.flow_weight:.6f}",
+                            "segmentation_activity_pct": f"{seg_activity_pct:.6f}",
+                            "segmentation_score": f"{seg_score:.6f}",
+                            "optical_flow_activity": f"{flow_activity:.6f}",
+                            "optical_flow_score": f"{flow_score:.6f}",
+                            "optical_flow_raw_activity": f"{raw_flow_activity:.6f}",
+                            "total_activity": f"{total_activity:.6f}",
+                            "previous_10_frame_count": (
+                                f"{int(score_averages['previous_10_frame_count'])}"
+                            ),
+                            "segmentation_score_prev10_avg": (
+                                f"{score_averages['segmentation_score_prev10_avg']:.6f}"
+                            ),
+                            "optical_flow_score_prev10_avg": (
+                                f"{score_averages['optical_flow_score_prev10_avg']:.6f}"
+                            ),
+                            "total_activity_prev10_avg": (
+                                f"{score_averages['total_activity_prev10_avg']:.6f}"
+                            ),
+                            "feeding_state": decision.state,
+                            "feeding_command": decision.command,
+                            "last_feeding_command": decision.last_command,
+                            "last_feeding_command_time_s": (
+                                f"{decision.last_command_time_s:.6f}"
+                            ),
+                            "decision_window_avg": f"{decision.window_avg:.6f}",
+                            "decision_background_score": (
+                                f"{decision.background_score:.6f}"
+                            ),
+                            "decision_threshold": f"{decision.threshold:.6f}",
+                            "decision_pause_count": decision.pause_count,
+                            "feeding_process_score": f"{decision.process_score:.6f}",
+                            "feeding_finish_reason": decision.finish_reason,
+                        }
+                    )
+                if decision.command != "none":
+                    if not (
+                        system_finish_received and decision.command == "finish"
+                    ):
+                        publish_decision_command(
+                            command_sink,
+                            {"command": decision.command},
+                            args.command_error_policy,
+                        )
+                if system_finish_received:
+                    LOGGER.info("stopping stream after system finish")
+                    break
+                if decision.command == "finish" and args.stop_after_finish == "on":
+                    LOGGER.info("stopping stream after finish command")
+                    break
                 score_history.append(
                     {
                         "segmentation_score": seg_score,
@@ -604,32 +936,85 @@ def main() -> int:
                 prev_gray_blur = gray_blur
                 processed_index += 1
 
-                if processed_index % 100 == 0:
-                    print(
-                        f"processed={processed_index} "
-                        f"time={time_s:.1f}s "
-                        f"seg_score={seg_score:.3f} "
-                        f"flow_score={flow_score:.3f} "
-                        f"total={total_activity:.1f}",
-                        flush=True,
+                if (
+                    args.progress_interval > 0
+                    and processed_index % args.progress_interval == 0
+                ):
+                    LOGGER.info(
+                        "processed=%s time=%.1fs seg_score=%.3f flow_score=%.3f total=%.1f state=%s command=%s",
+                        processed_index,
+                        time_s,
+                        seg_score,
+                        flow_score,
+                        total_activity,
+                        decision.state,
+                        decision.command,
                     )
 
-            ok, frame = cap.read()
+            ok, next_frame = cap.read()
+            while not ok:
+                consecutive_read_failures += 1
+                if not is_stream_source(input_source):
+                    break
+                if (
+                    args.camera_read_fail_limit > 0
+                    and consecutive_read_failures >= args.camera_read_fail_limit
+                ):
+                    LOGGER.error(
+                        "stopping after %s consecutive frame-read failures",
+                        consecutive_read_failures,
+                    )
+                    break
+                time.sleep(0.05)
+                ok, next_frame = cap.read()
             if not ok:
                 break
+            frame = next_frame
+            consecutive_read_failures = 0
             frame = resize_frame(frame, args.resize_width)
             source_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-            current_time_s = args.start_second + max(0, source_frame_index) / fps
+            if source_frame_index < 0:
+                source_frame_index = processed_index + 1
+            current_time_s = max(0, source_frame_index) / fps
             if max_end_time is not None and current_time_s >= max_end_time:
                 break
     finally:
-        csv_file.close()
-        writer.release()
+        if csv_file is not None:
+            csv_file.close()
+        if writer is not None:
+            writer.release()
         cap.release()
 
-    print(f"Wrote annotated video: {output}")
-    print(f"Wrote activity CSV: {csv_output}")
+    final_score = None
+    if all_score_count > 0:
+        final_score = all_score_sum / float(all_score_count)
+    write_score_workbook(excel_output, compact_score_rows, final_score)
+    LOGGER.info("wrote score Excel: %s", excel_output)
+
+    if final_score is not None:
+        publish_final_score(
+            final_score_sink,
+            final_score_payload(final_score),
+            args.command_error_policy,
+        )
+        LOGGER.info(
+            "published final feeding score %.6f after %s frames",
+            final_score,
+            all_score_count,
+        )
+
+    if output is not None and args.headless == "off":
+        LOGGER.info("wrote annotated video: %s", output)
+    if csv_output is not None:
+        LOGGER.info("wrote activity CSV: %s", csv_output)
+        LOGGER.info("wrote metadata: %s", metadata_output)
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    setup_logging(args.log_level)
+    return run_pipeline(args)
 
 
 if __name__ == "__main__":

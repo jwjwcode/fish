@@ -27,9 +27,13 @@ def bottom_panel_layout(
 ) -> tuple[int, int, int]:
     text_area_width = 330
     available_for_maps = max(240, frame_width - text_area_width - 72)
-    preview_width = min(requested_preview_width, max(120, available_for_maps // 2))
+    auto_preview_width = max(120, available_for_maps // 2)
+    if requested_preview_width <= 0:
+        preview_width = auto_preview_width
+    else:
+        preview_width = min(requested_preview_width, auto_preview_width)
     preview_height = max(1, int(round(frame_height * (preview_width / frame_width))))
-    panel_height = max(270, preview_height + 74)
+    panel_height = max(170, preview_height + 58)
     return panel_height, preview_width, text_area_width
 
 
@@ -209,39 +213,17 @@ def overlay_visuals(
     cv2.line(canvas, (0, height), (width - 1, height), (80, 80, 80), 1)
 
     lines = [
-        f"Time: {time_s:7.2f} s",
-        f"Seg score:    {values['seg_score']:7.3f}",
-        f"Flow score:   {values['flow_score']:7.3f}",
-        f"Total score:  {values['total_activity']:7.3f}",
-        f"Prev10 avg:   {values['total_activity_prev10_avg']:7.3f}",
+        f"Current seg:    {values['seg_score']:7.3f}",
+        f"Current flow:   {values['flow_score']:7.3f}",
+        f"Current total:  {values['total_activity']:7.3f}",
+        f"Prev10 total:   {values['total_activity_prev10_avg']:7.3f}",
     ]
-    if "feeding_state" in values:
-        last_command = str(values.get("last_feeding_command", "none"))
-        last_command_time_s = float(values.get("last_feeding_command_time_s", -1.0))
-        lines.extend(
-            [
-                f"State: {values['feeding_state']}",
-                f"Cmd: {values['feeding_command']}",
-                (
-                    "Last cmd: "
-                    f"{last_command} @ {last_command_time_s:5.1f}s"
-                    if last_command_time_s >= 0
-                    else "Last cmd: none"
-                ),
-                (
-                    "Win10/Thr: "
-                    f"{values['decision_window_avg']:5.2f}/"
-                    f"{values['decision_threshold']:5.2f}"
-                ),
-                f"Feed avg:    {values['feeding_process_score']:7.3f}",
-            ]
-        )
     panel_y = height
     put_text_panel(canvas, lines, (18, panel_y + 16))
 
     mask_preview = make_mask_preview(mask, (height, width), x0, x1, preview_width)
     flow_preview = make_flow_preview(flow_mag, (height, width), x0, x1, preview_width)
-    preview_y = panel_y + 64
+    preview_y = panel_y + 48
     mask_x = text_area_width + 36
     flow_x = min(width - flow_preview.shape[1] - 18, mask_x + mask_preview.shape[1] + 18)
     paste_preview(canvas, mask_preview, (mask_x, preview_y), "Seg map - ROI signal")
