@@ -96,6 +96,13 @@ class PipelineRuntimeTest(unittest.TestCase):
             self.assertIn("current_total_activity", score_sheet)
             self.assertIn("previous_10_total_activity_average", score_sheet)
             self.assertIn("final_feeding_score", summary_sheet)
+            summary_values = [
+                float(value)
+                for value in re.findall(r"<v>([-0-9.eE]+)</v>", summary_sheet)
+            ]
+            self.assertGreaterEqual(len(summary_values), 2)
+            self.assertAlmostEqual(summary_values[0], csv_score_avg, places=5)
+            self.assertEqual(int(summary_values[1]), len(rows))
 
     def test_default_run_writes_only_video_and_excel_with_video_time(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

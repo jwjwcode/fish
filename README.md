@@ -53,9 +53,11 @@ python3 -m pip install -r requirements.txt
 
 ```text
 scripts/feeding_activity_v1.py       # compatibility CLI wrapper
+scripts/feeding_activity_gui.py      # local tuning GUI
 scripts/feeding_activity_mqtt_runtime.py
 scripts/feeding_activity_mqtt_multistream_runtime.py
 fish_activity/pipeline_v1.py         # V1 CLI orchestration
+fish_activity/gui.py                 # Tkinter live preview GUI
 fish_activity/config.py              # config loading and presets
 fish_activity/detectors/base.py      # common detector result contract
 fish_activity/detectors/unsupervised.py
@@ -101,6 +103,23 @@ To run from a repeatable config:
   A6_20260506T161254_abw722_biomass14944_feed12_feedcap12_feedremaining-0_score5.mkv \
   --config configs/unsup_no_flow.json
 ```
+
+## GUI Tuning
+
+Launch the local GUI with:
+
+```bash
+.venv/bin/python scripts/feeding_activity_gui.py
+```
+
+The GUI lets you select a video and config, adjust the activity threshold,
+segmentation weight, optical-flow weight, resize width, Excel output path, and
+processed-video output path, then preview every processed frame live with the
+same ROI, fixed-size score panel, segmentation map, and flow map used by the
+annotated-video output. Real-time playback is enabled by default so frames are
+not skipped just to keep the preview fast. When Save Excel or Save Video is
+enabled, outputs are written at the end of the video, or as partial outputs if
+you press Stop.
 
 Config keys use the same names as CLI options, without the leading `--`. Nested
 sections are allowed; command-line flags override matching config values.
