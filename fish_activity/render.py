@@ -25,7 +25,7 @@ def bottom_panel_layout(
     frame_height: int,
     requested_preview_width: int,
 ) -> tuple[int, int, int]:
-    text_area_width = 330
+    text_area_width = 360
     available_for_maps = max(240, frame_width - text_area_width - 72)
     auto_preview_width = max(120, available_for_maps // 2)
     if requested_preview_width <= 0:
@@ -37,7 +37,12 @@ def bottom_panel_layout(
     return panel_height, preview_width, text_area_width
 
 
-def put_text_panel(frame: np.ndarray, lines: list[str], origin: tuple[int, int]) -> None:
+def put_text_panel(
+    frame: np.ndarray,
+    lines: list[str],
+    origin: tuple[int, int],
+    panel_width: int | None = None,
+) -> None:
     x, y = origin
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.68
@@ -48,7 +53,7 @@ def put_text_panel(frame: np.ndarray, lines: list[str], origin: tuple[int, int])
     for line in lines:
         (text_w, _), _ = cv2.getTextSize(line, font, font_scale, thickness)
         widths.append(text_w)
-    panel_w = max(widths) + padding * 2
+    panel_w = panel_width if panel_width is not None else max(widths) + padding * 2
     panel_h = line_height * len(lines) + padding * 2
     cv2.rectangle(frame, (x, y), (x + panel_w, y + panel_h), (0, 0, 0), -1)
     cv2.rectangle(frame, (x, y), (x + panel_w, y + panel_h), (255, 255, 255), 1)
@@ -219,7 +224,7 @@ def overlay_visuals(
         f"Prev10 total:   {values['total_activity_prev10_avg']:7.3f}",
     ]
     panel_y = height
-    put_text_panel(canvas, lines, (18, panel_y + 16))
+    put_text_panel(canvas, lines, (18, panel_y + 16), text_area_width - 36)
 
     mask_preview = make_mask_preview(mask, (height, width), x0, x1, preview_width)
     flow_preview = make_flow_preview(flow_mag, (height, width), x0, x1, preview_width)
